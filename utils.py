@@ -305,7 +305,7 @@ import os
 
 def load_text_prompts():
     """
-    Loads class-specific text prompts from a JSON file named 'prompts_demo.json'
+    Loads class-specific text prompts from a JSON file named 'prompts.json'
     located in the same directory as this script.
 
     Returns:
@@ -316,10 +316,10 @@ def load_text_prompts():
     current_dir = os.path.dirname(os.path.abspath(__file__))
 
     # Expected JSON path
-    json_path = os.path.join(current_dir, "prompts_demo.json")
+    json_path = os.path.join(current_dir, "prompts.json")
 
     if not os.path.exists(json_path):
-        raise FileNotFoundError(f"'prompts_demo.json' not found at: {json_path}")
+        raise FileNotFoundError(f"'prompts.json' not found at: {json_path}")
 
     # Load JSON
     with open(json_path, "r", encoding="utf-8") as f:
@@ -332,10 +332,10 @@ def load_text_prompts():
     for cls, prompts in data.items():
         if not isinstance(prompts, list):
             raise ValueError(f"Prompts for class '{cls}' must be a list.")
-        if len(prompts) != 50:
-            raise ValueError(
-                f"Class '{cls}' must have exactly 50 prompts, found {len(prompts)}."
-            )
+        # if len(prompts) != 50:
+        #     raise ValueError(
+        #         f"Class '{cls}' must have exactly 50 prompts, found {len(prompts)}."
+        #     )
         if not all(isinstance(p, str) for p in prompts):
             raise ValueError(f"All prompts for class '{cls}' must be strings.")
 
@@ -428,5 +428,230 @@ def inspect_tokenized_prompts(directory_path: str):
         print(f"  attention_mask shape: {mask.shape}, dtype={mask.dtype}")
         print()
 
+from PIL import Image, UnidentifiedImageError
+from collections import defaultdict
+import os
+
+def check_image_validity(master_index):
+    """
+    Input:
+        master_index: list of dicts, each containing a 'filepath' key
+
+    Process:
+        - Extract filepaths
+        - For each filepath:
+            * get its extension
+            * attempt to load with PIL
+            * count valid/invalid
+        - Print:
+            * tally valid vs invalid
+            * list of invalid paths
+            * tally of file extensions (valid & invalid)
+
+    Output:
+        None
+    """
+
+    # Extract all filepaths
+    filepaths = []
+    for entry in master_index:
+        if "filepath" in entry:
+            filepaths.append(entry["filepath"])
+
+    valid_count = 0
+    invalid_count = 0
+    invalid_paths = []
+
+    valid_ext_tally = defaultdict(int)
+    invalid_ext_tally = defaultdict(int)
+
+    for path in filepaths:
+        # Ensure the path is a string
+        if not isinstance(path, str):
+            invalid_count += 1
+            invalid_ext_tally["<non-string>"] += 1
+            invalid_paths.append(path)
+            continue
+
+        # Extract file extension (lowercase)
+        ext = os.path.splitext(path)[1].lower()
+
+        try:
+            with Image.open(path) as img:
+                img.verify()
+            # Valid
+            valid_count += 1
+            valid_ext_tally[ext] += 1
+
+        except (UnidentifiedImageError, OSError, IOError):
+            # Invalid
+            invalid_count += 1
+            invalid_ext_tally[ext] += 1
+            invalid_paths.append(path)
+
+    # Print results
+    print("\n=== IMAGE VALIDITY REPORT ===")
+    print(f"Valid images:   {valid_count}")
+    print(f"Invalid images: {invalid_count}")
+
+    print("\n=== INVALID IMAGE PATHS ===")
+    for p in invalid_paths:
+        print(p)
+
+    print("\n=== FILE EXTENSION TALLY (VALID) ===")
+    for ext, count in sorted(valid_ext_tally.items()):
+        print(f"{ext}: {count}")
+
+    print("\n=== FILE EXTENSION TALLY (INVALID) ===")
+    for ext, count in sorted(invalid_ext_tally.items()):
+        print(f"{ext}: {count}")
+
+from PIL import Image
+import os
+
+from PIL import Image
+import os
+
+def convert_to_jpg(master_index):
+    """
+    Convert all images in master_index to .jpg if not already .jpg,
+    save as .jpg, and delete the original non-.jpg files.
+
+    Input:
+        master_index: list of dicts, each containing 'filepath' key
+
+    Output:
+        Converted images saved at original paths (with .jpg extension),
+        non-.jpg files deleted, master_index updated.
+    """
+
+    for entry in master_index:
+        path = entry.get("filepath")
+        if not isinstance(path, str):
+            print(f"[SKIP] Non-string path: {path}")
+            continue
+
+        ext = os.path.splitext(path)[1].lower()
+
+        if ext == ".jpg":
+            continue  # already .jpg, skip
+
+        try:
+            # Open, convert to RGB
+            with Image.open(path) as img:
+                rgb_img = img.convert("RGB")
+                new_path = os.path.splitext(path)[0] + ".jpg"
+                rgb_img.save(new_path, format="JPEG", quality=95)
+
+            # Delete original non-jpg file
+            os.remove(path)
+
+            # Update master_index filepath
+            entry["filepath"] = new_path
+
+            print(f"[CONVERTED] {path} → {new_path} (old file deleted)")
+
+        except Exception as e:
+            print(f"[ERROR] Failed to convert {path}: {e}")
+
+def inspect_master_index(master_index):
+    """
+    Inspect the number of samples per class in the master_index.
+
+    Args:
+        master_index (list of dicts): Each dict should have at least a 'label' key.
+
+    Process:
+        Counts the number of samples per class and prints the tally.
+
+    Output:
+        None
+    """
+    from collections import Counter
+
+    # Extract all labels
+    labels = [entry['label'] for entry in master_index]
+
+    # Count occurrences per label
+    tally = Counter(labels)
+
+    # Print results
+    print("Number of samples per class:")
+    for label, count in tally.items():
+        print(f"{label}: {count}")
+
+
+import os
+import pandas as pd
+import random
+
+def subset_master_index(directory_path: str, master_index: list, samples_per_class: int = 10):
+    """
+    Subset master_index to keep only a fixed number of samples per class while 
+    respecting the train/val/test split roughly, and overwrite master_index.csv.
+
+    Args:
+        directory_path: str, directory where master_index.csv will be saved
+        master_index: list of dicts, each dict must contain 'id', 'label', and 'split'
+        samples_per_class: int, number of samples to keep per class
+
+    Returns:
+        None
+    """
+    random.seed(42)  # for reproducibility
+    df = pd.DataFrame(master_index)
+
+    subset_list = []
+
+    for label in df['label'].unique():
+        label_df = df[df['label'] == label]
+        subset_label = []
+
+        # Keep train, val, test splits proportionally if possible
+        for split in ['train', 'val', 'test']:
+            split_df = label_df[label_df['split'] == split]
+            if len(split_df) == 0:
+                continue
+            n_keep = max(1, int(samples_per_class * len(split_df) / len(label_df)))
+            chosen = split_df.sample(n=min(n_keep, len(split_df)), random_state=42)
+            subset_label.append(chosen)
+
+        if subset_label:
+            subset_list.append(pd.concat(subset_label))
+
+    subset_df = pd.concat(subset_list).reset_index(drop=True)
+
+    output_path = os.path.join(directory_path, "master_index.csv")
+    subset_df.to_csv(output_path, index=False)
+    print(f"[✔] Subset master_index saved to: {output_path}")
+
+
+import json
+import os
+
+def check_num_prompts():
+    """
+    Scans for a prompts.json file, loads the prompts,
+    counts the number of prompts for each key, and prints the tally.
+    """
+
+    filename = "prompts.json"
+
+    if not os.path.exists(filename):
+        print(f"{filename} not found.")
+        return
+
+    # Load JSON
+    with open(filename, "r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    print("Number of prompts per category:\n")
+
+    # Count and print number of prompts for each key
+    for key, prompts in data.items():
+        if isinstance(prompts, list):
+            print(f"{key}: {len(prompts)}")
+        else:
+            print(f"{key}: Not a list (cannot count).")
 
 

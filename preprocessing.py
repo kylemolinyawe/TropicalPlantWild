@@ -149,16 +149,20 @@ from tqdm import tqdm
 def extract_feature_vectors(directory_path: str,
                             dataset_split: str,
                             pt_file_paths: list,
-                            master_index: list):
+                            master_index: list,
+                            num_rois: int = 5,        # maximum number of ROIs per sample
+                            feature_dim: int = 256):  # dimension of ROI features from backbone
     """
     Extracts feature vectors from ROI .pt files using Faster R-CNN backbone.
-    Searches the master_index by the 'id' field instead of dict keys.
+    Pads samples with zero ROIs to `num_rois` if no ROIs are found.
 
     Args:
         directory_path (str): Root dataset path.
         dataset_split (str): Dataset split folder (e.g., 'train').
         pt_file_paths (list): List of .pt file paths containing ROI boxes.
         master_index (list): List of dicts with 'id' and 'filepath' entries.
+        num_rois (int): Maximum number of ROIs per sample.
+        feature_dim (int): Feature dimension of ROI embeddings.
     """
 
     # -----------------------------
@@ -196,10 +200,6 @@ def extract_feature_vectors(directory_path: str,
             tqdm.write(f"[ERROR] Could not load {pt_path}: {e}")
             continue
 
-        if boxes is None or boxes.numel() == 0:
-            tqdm.write(f"[WARNING] No ROIs for sample_id={sample_id}")
-            continue
-
         # -----------------------------
         # Search master_index by 'id' column
         # -----------------------------
@@ -220,31 +220,43 @@ def extract_feature_vectors(directory_path: str,
         # -----------------------------
         img = Image.open(img_path).convert("RGB")
         roi_crops = []
-        for box in boxes:
-            x1, y1, x2, y2 = box.int().tolist()
-            crop = img.crop((x1, y1, x2, y2))
-            roi_crops.append(resize_roi(crop))
 
+        if boxes is not None and boxes.numel() > 0:
+            for box in boxes:
+                x1, y1, x2, y2 = box.int().tolist()
+                crop = img.crop((x1, y1, x2, y2))
+                roi_crops.append(resize_roi(crop))
+
+        # Pad with zeros if no ROIs
         if len(roi_crops) == 0:
-            tqdm.write(f"[WARNING] No valid ROI crops for sample_id={sample_id}")
-            continue
+            roi_vectors = torch.zeros((num_rois, feature_dim))
+        else:
+            roi_batch = torch.stack(roi_crops).to(device)
 
-        roi_batch = torch.stack(roi_crops).to(device)
+            # -----------------------------
+            # Extract feature vectors
+            # -----------------------------
+            with torch.no_grad():
+                feat_maps = backbone(roi_batch)
 
-        # -----------------------------
-        # Extract feature vectors
-        # -----------------------------
-        with torch.no_grad():
-            feat_maps = backbone(roi_batch)
+            feat = feat_maps["0"] if isinstance(feat_maps, dict) else feat_maps
+            feat_vectors = feat.mean(dim=[2, 3]).cpu()  # Global average pool
 
-        feat = feat_maps["0"] if isinstance(feat_maps, dict) else feat_maps
-        feat_vectors = feat.mean(dim=[2, 3]).cpu()  # Global average pool
+            # -----------------------------
+            # Pad or truncate to num_rois
+            # -----------------------------
+            actual_rois = feat_vectors.shape[0]
+            if actual_rois < num_rois:
+                padding = torch.zeros((num_rois - actual_rois, feat_vectors.shape[1]))
+                roi_vectors = torch.cat([feat_vectors, padding], dim=0)
+            else:
+                roi_vectors = feat_vectors[:num_rois]
 
         # -----------------------------
         # Save feature vectors
         # -----------------------------
         save_path = os.path.join(save_dir, f"{unique_id}.pt")
-        torch.save(feat_vectors, save_path)
+        torch.save(roi_vectors, save_path)
 
 
 import os

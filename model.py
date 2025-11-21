@@ -16,7 +16,9 @@ def map_labels_to_int(unique_labels: list):
     return label_to_int
 
 
-
+import os
+import torch
+from transformers import BertTokenizer
 
 def tokenize_text_prompts(directory_path: str, class_prompts: dict):
     """
@@ -31,9 +33,6 @@ def tokenize_text_prompts(directory_path: str, class_prompts: dict):
             }
         }
     """
-    import os
-    import torch
-    from transformers import BertTokenizer
 
     # Ensure directory
     os.makedirs(directory_path, exist_ok=True)
@@ -263,7 +262,7 @@ def train_visualbert(
     visualbert_input,
     val_input=None,  # optional validation set
     filename: str = "visualbert_model.pt",
-    num_epochs=3,
+    num_epochs=10,
     batch_size=4,
     lr=1e-5
 ):
@@ -273,8 +272,8 @@ def train_visualbert(
     Args:
         visualbert_input: dict returned by prepare_visualbert_input_tensors (train set)
         val_input: dict returned by prepare_visualbert_input_tensors (validation set, optional)
-        directory_path: str, where to save the model
-        filename: str, model filename
+        directory_path: str, parent directory where 'models' folder exists
+        filename: str, model filename (e.g., 'visualbert_model.pt')
         num_epochs: int
         batch_size: int
         lr: float
@@ -352,7 +351,6 @@ def train_visualbert(
                 for batch in val_loader:
                     input_ids = tensorize(batch["input_ids"]).long()
                     attention_mask = tensorize(batch["attention_mask"]).long()
-                    # detach visual embeds to be extra safe
                     visual_embeds = tensorize(batch["visual_embeds"]).float().detach()
                     labels = tensorize(batch["label"]).long()
 
@@ -368,9 +366,14 @@ def train_visualbert(
             print(f"Validation Loss: {val_loss/len(val_loader):.4f}, Accuracy: {val_acc:.4f}")
 
     # -------------------
-    # Save model
+    # Save model to: models/<model_name>/<filename>
     # -------------------
-    os.makedirs(directory_path, exist_ok=True)
-    save_path = os.path.join(directory_path, filename)
+    model_name = os.path.splitext(filename)[0]     # remove .pt
+    model_folder = os.path.join(directory_path, model_name)
+
+    os.makedirs(model_folder, exist_ok=True)
+
+    save_path = os.path.join(model_folder, filename)
     torch.save(model.state_dict(), save_path)
+
     print(f"Model saved to: {save_path}")
