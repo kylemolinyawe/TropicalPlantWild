@@ -140,6 +140,8 @@ def prepare_visualbert_input(
         # Load the ROI tensor
         roi_tensor = torch.load(roi_path, weights_only=True)    # [num_actual_rois, feat_dim]
 
+        actual_rois = roi_tensor.shape[0]  # number of real ROIs before padding
+
         # Project to 768 if needed
         if roi_tensor.shape[-1] != visualbert_hidden_dim:
             if projector is None:
@@ -147,34 +149,29 @@ def prepare_visualbert_input(
             roi_tensor = projector(roi_tensor)
 
         # Pad or truncate ROIs
-        actual_rois = roi_tensor.shape[0]
-
         if actual_rois < num_rois:
             padding = torch.zeros((num_rois - actual_rois, visualbert_hidden_dim))
             roi_tensor = torch.cat([roi_tensor, padding], dim=0)
-
         elif actual_rois > num_rois:
             roi_tensor = roi_tensor[:num_rois, :]
+            actual_rois = num_rois  # adjust actual_rois after truncation
+
+        visual_embeds_list.append(roi_tensor)
 
         # -----------------------------
-        # Append visual embeddings
+        # Correct visual_attention_mask
         # -----------------------------
-        visual_embeds_list.append(roi_tensor)
+        mask_real = torch.ones(actual_rois, dtype=torch.long)
+        mask_pad = torch.zeros(num_rois - actual_rois, dtype=torch.long)
+        mask = torch.cat([mask_real, mask_pad], dim=0)
+        visual_attention_mask_list.append(mask)
 
         # -----------------------------
         # Append text embedding + mask
         # -----------------------------
         token_entry = tokenized[label_name]
-
         input_ids_list.append(token_entry["input_ids"])
         attention_mask_list.append(token_entry["attention_mask"])
-
-        # -----------------------------
-        # Visual attention mask
-        # -----------------------------
-        visual_attention_mask_list.append(
-            torch.ones(num_rois, dtype=torch.long)
-        )
 
         # -----------------------------
         # Label integer
@@ -250,51 +247,55 @@ class VisualBERTWithClassifier(nn.Module):
         logits = self.classifier(pooled_output)  # [batch, num_classes]
         return logits
 
+import csv
 from tqdm import tqdm
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 import os
+import numpy as np
+import random
 
 def train_visualbert(
     directory_path: str,
     visualbert_input,
-    val_input=None,  # optional validation set
+    val_input=None,
     filename: str = "visualbert_model.pt",
     num_epochs=10,
     batch_size=4,
-    lr=1e-5
+    lr=1e-5,
+    log_probabilities: bool = False,
+    seed: int = 42
 ):
     """
-    Train VisualBERT + classifier and save the trained model.
-
-    Args:
-        visualbert_input: dict returned by prepare_visualbert_input_tensors (train set)
-        val_input: dict returned by prepare_visualbert_input_tensors (validation set, optional)
-        directory_path: str, parent directory where 'models' folder exists
-        filename: str, model filename (e.g., 'visualbert_model.pt')
-        num_epochs: int
-        batch_size: int
-        lr: float
+    Train VisualBERT + classifier with logging capability using visual_attention_mask,
+    and log per-sample probabilities including true labels and predicted labels.
+    Deterministic behavior is enforced using the provided seed.
     """
 
-    # Infer number of classes from labels
+    # -------------------------------
+    # Seed everything for determinism
+    # -------------------------------
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # ----------------------------------------------------
+    # Setup
+    # ----------------------------------------------------
     num_classes = max(visualbert_input["labels"]) + 1
     print(f"Inferred number of classes: {num_classes}")
 
-    # Set device automatically
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # Instantiate model
     model = VisualBERTWithClassifier(num_classes)
     model.to(device)
-    model.train()
 
-    # -------------------
-    # DataLoaders
-    # -------------------
     train_dataset = VisualBERTDataset(visualbert_input)
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 
@@ -310,25 +311,55 @@ def train_visualbert(
             return x.to(device)
         return torch.stack(x).to(device)
 
-    # -------------------
-    # Training loop
-    # -------------------
+    # ----------------------------------------------------
+    # Setup logging files
+    # ----------------------------------------------------
+    model_name = os.path.splitext(filename)[0]
+    model_folder = os.path.join(directory_path, model_name)
+    os.makedirs(model_folder, exist_ok=True)
+
+    metrics_path = os.path.join(model_folder, "training_metrics.csv")
+    train_prob_path = os.path.join(model_folder, "train_per_sample_class_probabilities.csv")
+    val_prob_path = os.path.join(model_folder, "val_per_sample_class_probabilities.csv")
+
+    # Write CSV header (metrics)
+    with open(metrics_path, "w", newline="") as f:
+        csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "val_accuracy"])
+
+    # Write CSV header (probabilities) if enabled
+    if log_probabilities:
+        header = ["epoch", "sample_index", "true_label", "pred_label"] + [f"class_{i}_prob" for i in range(num_classes)]
+        with open(train_prob_path, "w", newline="") as f:
+            csv.writer(f).writerow(header)
+        if val_input:
+            with open(val_prob_path, "w", newline="") as f:
+                csv.writer(f).writerow(header)
+
+    # ----------------------------------------------------
+    # Training Loop
+    # ----------------------------------------------------
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
 
+        # -------- Train Phase --------
         for batch in loop:
             optimizer.zero_grad()
 
             input_ids = tensorize(batch["input_ids"]).long()
             attention_mask = tensorize(batch["attention_mask"]).long()
             visual_embeds = tensorize(batch["visual_embeds"]).float().detach()
+            visual_attention_mask = tensorize(batch["visual_attention_mask"]).long()
             labels = tensorize(batch["label"]).long()
 
-            # Forward + backward
-            logits = model(input_ids=input_ids, visual_embeds=visual_embeds)
+            logits = model(
+                input_ids=input_ids,
+                visual_embeds=visual_embeds,
+                visual_attention_mask=visual_attention_mask
+            )
             loss = criterion(logits, labels)
+
             loss.backward()
             optimizer.step()
 
@@ -336,14 +367,14 @@ def train_visualbert(
             loop.set_postfix(loss=loss.item())
 
         avg_train_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1}/{num_epochs}, Train Loss: {avg_train_loss:.4f}")
+        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}")
 
-        # -------------------
-        # Validation loop
-        # -------------------
+        # -------- Validation Phase --------
+        val_loss = 0
+        val_acc = 0
+
         if val_input:
             model.eval()
-            val_loss = 0.0
             correct = 0
             total = 0
 
@@ -352,28 +383,86 @@ def train_visualbert(
                     input_ids = tensorize(batch["input_ids"]).long()
                     attention_mask = tensorize(batch["attention_mask"]).long()
                     visual_embeds = tensorize(batch["visual_embeds"]).float().detach()
+                    visual_attention_mask = tensorize(batch["visual_attention_mask"]).long()
                     labels = tensorize(batch["label"]).long()
 
-                    logits = model(input_ids=input_ids, visual_embeds=visual_embeds)
+                    logits = model(
+                        input_ids=input_ids,
+                        visual_embeds=visual_embeds,
+                        visual_attention_mask=visual_attention_mask
+                    )
                     loss = criterion(logits, labels)
+
                     val_loss += loss.item()
 
-                    preds = torch.argmax(logits, dim=1)
+                    preds = logits.argmax(dim=1)
                     correct += (preds == labels).sum().item()
                     total += labels.size(0)
 
             val_acc = correct / total
-            print(f"Validation Loss: {val_loss/len(val_loader):.4f}, Accuracy: {val_acc:.4f}")
+            val_loss /= len(val_loader)
+            print(f"Validation Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
 
-    # -------------------
-    # Save model to: models/<model_name>/<filename>
-    # -------------------
-    model_name = os.path.splitext(filename)[0]     # remove .pt
-    model_folder = os.path.join(directory_path, model_name)
+        # -------- Write Metrics --------
+        with open(metrics_path, "a", newline="") as f:
+            csv.writer(f).writerow([epoch+1, avg_train_loss, val_loss, val_acc])
 
-    os.makedirs(model_folder, exist_ok=True)
+        # -------- Write per-sample probabilities --------
+        if log_probabilities:
+            model.eval()
+            sample_index = 0
 
+            # --- Train probabilities ---
+            with torch.no_grad(), open(train_prob_path, "a", newline="") as f:
+                writer = csv.writer(f)
+                for batch in train_loader:
+                    input_ids = tensorize(batch["input_ids"]).long()
+                    attention_mask = tensorize(batch["attention_mask"]).long()
+                    visual_embeds = tensorize(batch["visual_embeds"]).float().detach()
+                    visual_attention_mask = tensorize(batch["visual_attention_mask"]).long()
+                    labels = batch["label"]
+
+                    logits = model(
+                        input_ids=input_ids,
+                        visual_embeds=visual_embeds,
+                        visual_attention_mask=visual_attention_mask
+                    )
+                    probs = torch.softmax(logits, dim=1)
+                    preds = logits.argmax(dim=1)
+
+                    for i, p in enumerate(probs.cpu().numpy()):
+                        row = [epoch+1, sample_index, int(labels[i].cpu().item()), int(preds[i].cpu().item())] + list(p)
+                        writer.writerow(row)
+                        sample_index += 1
+
+            # --- Validation probabilities ---
+            if val_input:
+                sample_index = 0
+                with torch.no_grad(), open(val_prob_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    for batch in val_loader:
+                        input_ids = tensorize(batch["input_ids"]).long()
+                        attention_mask = tensorize(batch["attention_mask"]).long()
+                        visual_embeds = tensorize(batch["visual_embeds"]).float().detach()
+                        visual_attention_mask = tensorize(batch["visual_attention_mask"]).long()
+                        labels = batch["label"]
+
+                        logits = model(
+                            input_ids=input_ids,
+                            visual_embeds=visual_embeds,
+                            visual_attention_mask=visual_attention_mask
+                        )
+                        probs = torch.softmax(logits, dim=1)
+                        preds = logits.argmax(dim=1)
+
+                        for i, p in enumerate(probs.cpu().numpy()):
+                            row = [epoch+1, sample_index, int(labels[i].cpu().item()), int(preds[i].cpu().item())] + list(p)
+                            writer.writerow(row)
+                            sample_index += 1
+
+    # ----------------------------------------------------
+    # Save model
+    # ----------------------------------------------------
     save_path = os.path.join(model_folder, filename)
     torch.save(model.state_dict(), save_path)
-
     print(f"Model saved to: {save_path}")

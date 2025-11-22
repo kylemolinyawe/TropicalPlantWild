@@ -1,0 +1,118 @@
+from math import e
+import utils
+import preprocessing
+from tqdm import tqdm
+import model
+import torch
+from torch.utils.data import DataLoader
+from transformers import BertTokenizer, VisualBertModel
+import os
+import vis
+import evaluate
+
+
+img_demo_dir = os.path.join('images_demo')
+img_dir = os.path.join('images')
+demo_dir = os.path.join('demo')
+models_dir = os.path.join('models')
+baseline_dir = os.path.join('baseline')
+
+dir = baseline_dir
+
+epochs = 5
+num_rois = 5
+epoch = 1
+num_classes = 8
+example_index = 374
+
+
+# 1 ROIs
+# ---
+
+# Creating the master index as a reference for every sample in the dataset
+# utils.generate_master_index(img_dir, dir)
+train_set, val_set, test_set = utils.load_master_index(dir)
+images = train_set + val_set + test_set
+
+# utils.convert_to_jpg(images)
+# utils.check_image_validity(images)
+
+
+print("")
+preprocessing.extract_rois_fasterrcnn(dir, 'train', train_set, num_rois)
+train_tensors_rois = utils.get_tensor_rois_file_paths(dir, 'train')
+utils.count_tensors_rois_shape(train_tensors_rois)
+
+print("")
+preprocessing.extract_rois_fasterrcnn(dir, 'val', val_set, num_rois)
+val_tensors_rois = utils.get_tensor_rois_file_paths(dir, 'val')
+utils.count_tensors_rois_shape(val_tensors_rois)
+
+print("")
+preprocessing.extract_rois_fasterrcnn(dir, 'test', test_set, num_rois)
+test_tensors_rois = utils.get_tensor_rois_file_paths(dir, 'test')
+utils.count_tensors_rois_shape(test_tensors_rois)
+
+
+# # Visualizing the ROIs per sample
+# for item in train_set:
+#     vis.plot_rois_on_image(dir, train_set, item['id'])
+
+
+# 2 Feature Vectors
+# ---
+
+print("")
+preprocessing.extract_feature_vectors(dir, 'train', train_tensors_rois, train_set)
+train_tensors_rois_features = utils.get_tensor_rois_features_file_paths(dir, 'train')
+utils.count_tensors_rois_shape(train_tensors_rois_features)
+
+print("")
+preprocessing.extract_feature_vectors(dir, 'val', val_tensors_rois, val_set)
+val_tensors_rois_features = utils.get_tensor_rois_features_file_paths(dir, 'val')
+utils.count_tensors_rois_shape(val_tensors_rois_features)
+
+print("")
+preprocessing.extract_feature_vectors(dir, 'test', test_tensors_rois, test_set)
+test_tensors_rois_features = utils.get_tensor_rois_features_file_paths(dir, 'test')
+utils.count_tensors_rois_shape(test_tensors_rois_features)
+
+
+
+# # 3 Visual Prototypes
+# # ---
+
+preprocessing.construct_visual_prototypes(dir, train_tensors_rois_features, train_set)
+utils.inspect_visual_prototypes(dir)
+
+# # 4 Model Training (VisualBERT)
+# #---
+
+# Text prompts
+print("")
+text_prompts = utils.load_text_prompts()
+print(text_prompts.keys())
+model.tokenize_text_prompts(dir, text_prompts)
+utils.inspect_tokenized_prompts(dir)
+
+# Labels
+print("")
+labels = utils.get_labels(dir)
+labels_int = model.map_labels_to_int(labels)
+
+# # Preparing VisualBERT input
+print("")
+train_visualbert_input = model.prepare_visualbert_input(dir, train_set, train_tensors_rois_features, labels_int, num_rois)
+val_visualbert_input = model.prepare_visualbert_input(dir, val_set, val_tensors_rois_features, labels_int, num_rois)
+
+
+# # Training VisualBERT
+print("")
+model.train_visualbert(models_dir, 
+                       train_visualbert_input, 
+                       val_input=val_visualbert_input,
+                       filename='baseline.pt')
+
+
+# 5 Evaluation
+# ---

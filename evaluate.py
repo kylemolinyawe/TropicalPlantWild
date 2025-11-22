@@ -112,10 +112,20 @@ def per_sample_class_probabilities(
     # -----------------------------
     metrics_dir = os.path.dirname(found_model_path)
     df_probs = pd.DataFrame(all_probs)
-    output_probs_path = os.path.join(metrics_dir, "per_sample_class_probabilities.csv")
+    output_probs_path = os.path.join(metrics_dir, "test_per_sample_class_probabilities.csv")
     df_probs.to_csv(output_probs_path, index=False)
     print(f"Per-sample class probabilities with predicted labels saved to: {output_probs_path}")
 
+
+import os
+import pandas as pd
+import numpy as np
+from sklearn.metrics import (
+    precision_score,
+    recall_score,
+    f1_score,
+    accuracy_score
+)
 
 import os
 import pandas as pd
@@ -124,15 +134,12 @@ from sklearn.metrics import precision_score, recall_score, f1_score, accuracy_sc
 
 def class_metrics(directory_path: str, model_name: str):
     """
-    Computes per-class metrics by loading the per-sample class probabilities CSV
-    for a given model.
+    Computes per-class metrics AND overall model metrics by loading the
+    per-sample class probabilities CSV for a given model.
 
-    Args:
-        directory_path: str, base directory where the model folder is located
-        model_name: str, filename of the saved model (used to locate the CSV)
-
-    Returns:
-        df_metrics: pd.DataFrame of per-class metrics
+    Saves two CSVs:
+    - class_metrics.csv
+    - model_metrics.csv
     """
     # -----------------------------
     # 1. Locate the model folder
@@ -147,7 +154,7 @@ def class_metrics(directory_path: str, model_name: str):
         raise FileNotFoundError(f"Model '{model_name}' not found under: {directory_path}")
 
     metrics_dir = os.path.dirname(found_model_path)
-    csv_path = os.path.join(metrics_dir, "per_sample_class_probabilities.csv")
+    csv_path = os.path.join(metrics_dir, "test_per_sample_class_probabilities.csv")
 
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"Per-sample class probabilities CSV not found at: {csv_path}")
@@ -187,9 +194,32 @@ def class_metrics(directory_path: str, model_name: str):
 
     df_metrics = pd.DataFrame(
         class_metrics,
-        columns=["class_name", "accuracy", "macro_recall", "macro_precision", "macro_f1"]
+        columns=["class_name", "accuracy", "recall", "precision", "f1"]
     )
 
-    output_path = os.path.join(metrics_dir, "class_metrics.csv")
-    df_metrics.to_csv(output_path, index=False)
-    print(f"Per-class metrics saved to: {output_path}")
+    # -----------------------------
+    # 5. Save per-class metrics
+    # -----------------------------
+    class_metrics_path = os.path.join(metrics_dir, "class_metrics.csv")
+    df_metrics.to_csv(class_metrics_path, index=False)
+    print(f"Per-class metrics saved to: {class_metrics_path}")
+
+    # -----------------------------
+    # 6. Compute overall model metrics
+    # -----------------------------
+    overall_accuracy = accuracy_score(y_true, y_pred)
+    overall_macro_recall = recall_score(y_true, y_pred, average="macro", zero_division=0)
+    overall_macro_precision = precision_score(y_true, y_pred, average="macro", zero_division=0)
+    overall_macro_f1 = f1_score(y_true, y_pred, average="macro", zero_division=0)
+
+    df_model_metrics = pd.DataFrame(
+        [[overall_accuracy, overall_macro_recall, overall_macro_precision, overall_macro_f1]],
+        columns=["accuracy", "macro_recall", "macro_precision", "macro_f1"]
+    )
+
+    # -----------------------------
+    # 7. Save overall model metrics
+    # -----------------------------
+    model_metrics_path = os.path.join(metrics_dir, "model_metrics.csv")
+    df_model_metrics.to_csv(model_metrics_path, index=False)
+    print(f"Model-level metrics saved to: {model_metrics_path}")
