@@ -192,7 +192,7 @@ def prepare_visualbert_input(
     # -------------------------------------------------
     # Print shapes
     # -------------------------------------------------
-    print("\nPrepared VisualBERT Input:")
+    print("Prepared VisualBERT Input:")
     print("input_ids:", [x.shape for x in input_ids_list[:3]])
     print("attention_mask:", [x.shape for x in attention_mask_list[:3]])
     print("visual_embeds:", [x.shape for x in visual_embeds_list[:3]])
@@ -256,6 +256,80 @@ from torch.utils.data import DataLoader
 import os
 import numpy as np
 import random
+import warnings
+
+def evaluate_and_log(
+    model,
+    data_loader,
+    criterion,
+    device,
+    num_classes,
+    epoch,
+    metrics_path,
+    prob_path=None,
+    log_probabilities=False
+):
+    """
+    Evaluate the model on a dataset and log metrics to CSV. Optionally log per-sample probabilities.
+    """
+    from sklearn.metrics import accuracy_score, recall_score, precision_score, f1_score
+
+    model.eval()
+    running_loss = 0.0
+    true_labels = []
+    preds_labels = []
+
+    # Compute metrics helper
+    def compute_metrics(true_labels, preds):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            acc = accuracy_score(true_labels, preds)
+            macro_recall = recall_score(true_labels, preds, average="macro", zero_division=0)
+            macro_precision = precision_score(true_labels, preds, average="macro", zero_division=0)
+            macro_f1 = f1_score(true_labels, preds, average="macro", zero_division=0)
+        return acc, macro_recall, macro_precision, macro_f1
+
+    sample_index = 0
+    with torch.no_grad():
+        for batch in data_loader:
+            input_ids = batch["input_ids"].to(device).long()
+            attention_mask = batch["attention_mask"].to(device).long()
+            visual_embeds = batch["visual_embeds"].to(device).float().detach()
+            visual_attention_mask = batch["visual_attention_mask"].to(device).long()
+            labels = batch["label"].to(device).long()
+
+            logits = model(
+                input_ids=input_ids,
+                visual_embeds=visual_embeds,
+                visual_attention_mask=visual_attention_mask
+            )
+
+            loss = criterion(logits, labels)
+            running_loss += loss.item()
+
+            preds = logits.argmax(dim=1)
+            true_labels.extend(labels.cpu().tolist())
+            preds_labels.extend(preds.cpu().tolist())
+
+            # Per-sample probability logging
+            if log_probabilities and prob_path:
+                probs = torch.softmax(logits, dim=1)
+                with open(prob_path, "a", newline="") as f:
+                    writer = csv.writer(f)
+                    for i, p in enumerate(probs.cpu().numpy()):
+                        row = [epoch + 1, sample_index, int(labels[i].cpu().item()), int(preds[i].cpu().item())] + list(p)
+                        writer.writerow(row)
+                        sample_index += 1
+
+    avg_loss = running_loss / len(data_loader)
+    acc, recall, precision, f1 = compute_metrics(true_labels, preds_labels)
+
+    # Write epoch metrics
+    with open(metrics_path, "a", newline="") as f:
+        csv.writer(f).writerow([epoch + 1, avg_loss, acc, recall, precision, f1])
+
+    return avg_loss, acc, recall, precision, f1
+
 
 def train_visualbert(
     directory_path: str,
@@ -269,13 +343,10 @@ def train_visualbert(
     seed: int = 42
 ):
     """
-    Train VisualBERT + classifier with logging capability using visual_attention_mask,
-    and log per-sample probabilities including true labels and predicted labels.
-    Deterministic behavior is enforced using the provided seed.
+    Train VisualBERT + classifier with epoch-level metrics and optional probability logging.
     """
-
     # -------------------------------
-    # Seed everything for determinism
+    # Deterministic seeds
     # -------------------------------
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -284,9 +355,9 @@ def train_visualbert(
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-    # ----------------------------------------------------
+    # -------------------------------
     # Setup
-    # ----------------------------------------------------
+    # -------------------------------
     num_classes = max(visualbert_input["labels"]) + 1
     print(f"Inferred number of classes: {num_classes}")
 
@@ -296,8 +367,16 @@ def train_visualbert(
     model = VisualBERTWithClassifier(num_classes)
     model.to(device)
 
+    # -------------------------------
+    # Data loaders
+    # -------------------------------
     train_dataset = VisualBERTDataset(visualbert_input)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        generator=torch.Generator().manual_seed(seed)
+    )
 
     if val_input:
         val_dataset = VisualBERTDataset(val_input)
@@ -311,39 +390,44 @@ def train_visualbert(
             return x.to(device)
         return torch.stack(x).to(device)
 
-    # ----------------------------------------------------
-    # Setup logging files
-    # ----------------------------------------------------
+    # -------------------------------
+    # Metrics files
+    # -------------------------------
     model_name = os.path.splitext(filename)[0]
     model_folder = os.path.join(directory_path, model_name)
     os.makedirs(model_folder, exist_ok=True)
 
-    metrics_path = os.path.join(model_folder, "training_metrics.csv")
-    train_prob_path = os.path.join(model_folder, "train_per_sample_class_probabilities.csv")
-    val_prob_path = os.path.join(model_folder, "val_per_sample_class_probabilities.csv")
+    train_metrics_path = os.path.join(model_folder, "train_model_metrics.csv")
+    val_metrics_path = os.path.join(model_folder, "val_model_metrics.csv")
 
-    # Write CSV header (metrics)
-    with open(metrics_path, "w", newline="") as f:
-        csv.writer(f).writerow(["epoch", "train_loss", "val_loss", "val_accuracy"])
+    with open(train_metrics_path, "w", newline="") as f:
+        csv.writer(f).writerow(["epoch", "loss", "accuracy", "macro_recall", "macro_precision", "macro_f1"])
+    with open(val_metrics_path, "w", newline="") as f:
+        csv.writer(f).writerow(["epoch", "loss", "accuracy", "macro_recall", "macro_precision", "macro_f1"])
 
-    # Write CSV header (probabilities) if enabled
+    # -------------------------------
+    # Per-sample probability headers
+    # -------------------------------
     if log_probabilities:
+        train_prob_path = os.path.join(model_folder, "train_per_sample_class_probabilities.csv")
+        val_prob_path = os.path.join(model_folder, "val_per_sample_class_probabilities.csv") if val_input else None
         header = ["epoch", "sample_index", "true_label", "pred_label"] + [f"class_{i}_prob" for i in range(num_classes)]
         with open(train_prob_path, "w", newline="") as f:
             csv.writer(f).writerow(header)
         if val_input:
-            with open(val_prob_path, "w", newline="") as f:
-                csv.writer(f).writerow(header)
+            if val_prob_path is not None:
+                with open(val_prob_path, "w", newline="") as f:
+                    csv.writer(f).writerow(header)
 
-    # ----------------------------------------------------
-    # Training Loop
-    # ----------------------------------------------------
+
+    # -------------------------------
+    # Training loop
+    # -------------------------------
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
 
-        # -------- Train Phase --------
         for batch in loop:
             optimizer.zero_grad()
 
@@ -358,111 +442,54 @@ def train_visualbert(
                 visual_embeds=visual_embeds,
                 visual_attention_mask=visual_attention_mask
             )
-            loss = criterion(logits, labels)
 
+            loss = criterion(logits, labels)
             loss.backward()
             optimizer.step()
 
             running_loss += loss.item()
             loop.set_postfix(loss=loss.item())
 
-        avg_train_loss = running_loss / len(train_loader)
-        print(f"Epoch {epoch+1}, Train Loss: {avg_train_loss:.4f}")
+        # -------------------------------
+        # Evaluate on train set
+        # -------------------------------
+        train_metrics = evaluate_and_log(
+            model=model,
+            data_loader=train_loader,
+            criterion=criterion,
+            device=device,
+            num_classes=num_classes,
+            epoch=epoch,
+            metrics_path=train_metrics_path,
+            prob_path=train_prob_path if log_probabilities else None,
+            log_probabilities=log_probabilities
+        )
+        print(f"[Epoch {epoch+1}] TRAIN → "
+              f"Loss: {train_metrics[0]:.4f} | Acc: {train_metrics[1]:.4f} | "
+              f"Recall: {train_metrics[2]:.4f} | Precision: {train_metrics[3]:.4f} | F1: {train_metrics[4]:.4f}")
 
-        # -------- Validation Phase --------
-        val_loss = 0
-        val_acc = 0
-
+        # -------------------------------
+        # Evaluate on validation set
+        # -------------------------------
         if val_input:
-            model.eval()
-            correct = 0
-            total = 0
+            val_metrics = evaluate_and_log(
+                model=model,
+                data_loader=val_loader,
+                criterion=criterion,
+                device=device,
+                num_classes=num_classes,
+                epoch=epoch,
+                metrics_path=val_metrics_path,
+                prob_path=val_prob_path if log_probabilities else None,
+                log_probabilities=log_probabilities
+            )
+            print(f"[Epoch {epoch+1}] VAL → "
+                  f"Loss: {val_metrics[0]:.4f} | Acc: {val_metrics[1]:.4f} | "
+                  f"Recall: {val_metrics[2]:.4f} | Precision: {val_metrics[3]:.4f} | F1: {val_metrics[4]:.4f}")
 
-            with torch.no_grad():
-                for batch in val_loader:
-                    input_ids = tensorize(batch["input_ids"]).long()
-                    attention_mask = tensorize(batch["attention_mask"]).long()
-                    visual_embeds = tensorize(batch["visual_embeds"]).float().detach()
-                    visual_attention_mask = tensorize(batch["visual_attention_mask"]).long()
-                    labels = tensorize(batch["label"]).long()
-
-                    logits = model(
-                        input_ids=input_ids,
-                        visual_embeds=visual_embeds,
-                        visual_attention_mask=visual_attention_mask
-                    )
-                    loss = criterion(logits, labels)
-
-                    val_loss += loss.item()
-
-                    preds = logits.argmax(dim=1)
-                    correct += (preds == labels).sum().item()
-                    total += labels.size(0)
-
-            val_acc = correct / total
-            val_loss /= len(val_loader)
-            print(f"Validation Loss: {val_loss:.4f}, Accuracy: {val_acc:.4f}")
-
-        # -------- Write Metrics --------
-        with open(metrics_path, "a", newline="") as f:
-            csv.writer(f).writerow([epoch+1, avg_train_loss, val_loss, val_acc])
-
-        # -------- Write per-sample probabilities --------
-        if log_probabilities:
-            model.eval()
-            sample_index = 0
-
-            # --- Train probabilities ---
-            with torch.no_grad(), open(train_prob_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                for batch in train_loader:
-                    input_ids = tensorize(batch["input_ids"]).long()
-                    attention_mask = tensorize(batch["attention_mask"]).long()
-                    visual_embeds = tensorize(batch["visual_embeds"]).float().detach()
-                    visual_attention_mask = tensorize(batch["visual_attention_mask"]).long()
-                    labels = batch["label"]
-
-                    logits = model(
-                        input_ids=input_ids,
-                        visual_embeds=visual_embeds,
-                        visual_attention_mask=visual_attention_mask
-                    )
-                    probs = torch.softmax(logits, dim=1)
-                    preds = logits.argmax(dim=1)
-
-                    for i, p in enumerate(probs.cpu().numpy()):
-                        row = [epoch+1, sample_index, int(labels[i].cpu().item()), int(preds[i].cpu().item())] + list(p)
-                        writer.writerow(row)
-                        sample_index += 1
-
-            # --- Validation probabilities ---
-            if val_input:
-                sample_index = 0
-                with torch.no_grad(), open(val_prob_path, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    for batch in val_loader:
-                        input_ids = tensorize(batch["input_ids"]).long()
-                        attention_mask = tensorize(batch["attention_mask"]).long()
-                        visual_embeds = tensorize(batch["visual_embeds"]).float().detach()
-                        visual_attention_mask = tensorize(batch["visual_attention_mask"]).long()
-                        labels = batch["label"]
-
-                        logits = model(
-                            input_ids=input_ids,
-                            visual_embeds=visual_embeds,
-                            visual_attention_mask=visual_attention_mask
-                        )
-                        probs = torch.softmax(logits, dim=1)
-                        preds = logits.argmax(dim=1)
-
-                        for i, p in enumerate(probs.cpu().numpy()):
-                            row = [epoch+1, sample_index, int(labels[i].cpu().item()), int(preds[i].cpu().item())] + list(p)
-                            writer.writerow(row)
-                            sample_index += 1
-
-    # ----------------------------------------------------
+    # -------------------------------
     # Save model
-    # ----------------------------------------------------
+    # -------------------------------
     save_path = os.path.join(model_folder, filename)
     torch.save(model.state_dict(), save_path)
     print(f"Model saved to: {save_path}")

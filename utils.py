@@ -214,7 +214,7 @@ def count_tensors_rois_shape(pt_file_paths: list):
         except Exception as e:
             print(f"[ERROR] Could not load {path}: {e}")
 
-    print("\n--- Final Tally of Tensor Shapes ---")
+    print("--- Final Tally of Tensor Shapes ---")
     for shape, count in tally.items():
         print(f"{shape}: {count} file(s)")
 
@@ -623,7 +623,7 @@ def subset_master_index(directory_path: str, master_index: list, samples_per_cla
 
     output_path = os.path.join(directory_path, "master_index.csv")
     subset_df.to_csv(output_path, index=False)
-    print(f"[✔] Subset master_index saved to: {output_path}")
+    print(f"Subset master_index saved to: {output_path}")
 
 
 import json
