@@ -173,3 +173,67 @@ def plot_per_sample_class_probabilities(directory_path: str, model_file_name: st
             save_path = os.path.join(out_folders[split], f"{title}.png")
             plt.savefig(save_path)
             plt.close()
+
+def plot_training_metrics(model_folder, model_name):
+    """
+    Plot training and validation metrics from CSV files
+    """
+    # Construct paths
+    base_path = os.path.join(model_folder, model_name.replace('.pt', ''))
+    train_metrics_path = os.path.join(base_path, "train_model_metrics.csv")
+    val_metrics_path = os.path.join(base_path, "val_model_metrics.csv")
+    
+    # Load data
+    train_df = pd.read_csv(train_metrics_path)
+    val_df = pd.read_csv(val_metrics_path)
+    
+    # Create subplots
+    fig, axes = plt.subplots(2, 2, figsize=(15, 10))
+    fig.suptitle(f'Training Metrics - {model_name}', fontsize=16)
+    
+    # Plot Loss
+    axes[0, 0].plot(train_df['epoch'], train_df['loss'], 'b-', label='Train Loss', linewidth=2)
+    axes[0, 0].plot(val_df['epoch'], val_df['loss'], 'r-', label='Val Loss', linewidth=2)
+    axes[0, 0].set_title('Loss')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Plot Accuracy
+    axes[0, 1].plot(train_df['epoch'], train_df['accuracy'], 'b-', label='Train Accuracy', linewidth=2)
+    axes[0, 1].plot(val_df['epoch'], val_df['accuracy'], 'r-', label='Val Accuracy', linewidth=2)
+    axes[0, 1].set_title('Accuracy')
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Accuracy')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
+    
+    # Plot F1 Score
+    axes[1, 0].plot(train_df['epoch'], train_df['macro_f1'], 'b-', label='Train F1', linewidth=2)
+    axes[1, 0].plot(val_df['epoch'], val_df['macro_f1'], 'r-', label='Val F1', linewidth=2)
+    axes[1, 0].set_title('Macro F1 Score')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('F1 Score')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Plot Precision/Recall
+    axes[1, 1].plot(train_df['epoch'], train_df['macro_precision'], 'g-', label='Train Precision', linewidth=2)
+    axes[1, 1].plot(val_df['epoch'], val_df['macro_precision'], 'm-', label='Val Precision', linewidth=2)
+    axes[1, 1].plot(train_df['epoch'], train_df['macro_recall'], 'c-', label='Train Recall', linewidth=2)
+    axes[1, 1].plot(val_df['epoch'], val_df['macro_recall'], 'y-', label='Val Recall', linewidth=2)
+    axes[1, 1].set_title('Precision & Recall')
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Score')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    save_path = os.path.join(base_path, "training_metrics.png")
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    print(f"Plot saved to: {save_path}")

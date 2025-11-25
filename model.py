@@ -330,6 +330,125 @@ def evaluate_and_log(
 
     return avg_loss, acc, recall, precision, f1
 
+def find_learning_rate(visualbert_input, batch_size=4, start_lr=1e-7, end_lr=1, num_iters=100,
+                            criterion=None, device=None, seed=42, safe_frac=0.1, max_lr=1e-3):
+    """
+    Safe Learning Rate Finder for VisualBERTWithClassifier.
+    Automatically picks a conservative LR suitable for transformers.
+    """
+    import math
+    import random
+    from torch.utils.data import DataLoader
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import torch
+    import torch.nn as nn
+    import torch.optim as optim
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # -------------------------------
+    # Deterministic
+    # -------------------------------
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # -------------------------------
+    # Hardcoded model
+    # -------------------------------
+    num_classes = max(visualbert_input["labels"]) + 1
+    model = VisualBERTWithClassifier(num_classes)
+    model.to(device)
+    model.train()
+
+    # -------------------------------
+    # Dataset and loader
+    # -------------------------------
+    dataset = VisualBERTDataset(visualbert_input)
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True,
+                        generator=torch.Generator().manual_seed(seed))
+
+    if criterion is None:
+        criterion = nn.CrossEntropyLoss()
+
+    optimizer = optim.AdamW(model.parameters(), lr=start_lr)
+
+    # Exponential LR increase
+    lr_mult = (end_lr / start_lr) ** (1 / num_iters)
+
+    lrs = []
+    losses = []
+    iter_count = 0
+
+    for batch in loader:
+        if iter_count >= num_iters:
+            break
+
+        optimizer.zero_grad()
+
+        input_ids = batch["input_ids"].to(device).long()
+        attention_mask = batch["attention_mask"].to(device).long()
+        visual_embeds = batch["visual_embeds"].to(device).float().detach()
+        visual_attention_mask = batch["visual_attention_mask"].to(device).long()
+        labels = batch["label"].to(device).long()
+
+        logits = model(
+            input_ids=input_ids,
+            visual_embeds=visual_embeds,
+            visual_attention_mask=visual_attention_mask
+        )
+
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        # record
+        current_lr = optimizer.param_groups[0]["lr"]
+        lrs.append(current_lr)
+        losses.append(loss.item())
+
+        print(f"Iter {iter_count+1}/{num_iters}: LR = {current_lr:.2e}, Loss = {loss.item():.4f}")
+
+        # update LR
+        optimizer.param_groups[0]["lr"] *= lr_mult
+        iter_count += 1
+
+    # -------------------------------
+    # Suggest safe LR
+    # -------------------------------
+    losses_np = np.array(losses)
+    lrs_np = np.array(lrs)
+    
+    grads = np.gradient(losses_np)
+    steepest_idx = np.argmin(grads)
+    best_lr_raw = lrs_np[steepest_idx]
+
+    # Apply safe fraction and max cap
+    best_lr = min(best_lr_raw * safe_frac, max_lr)
+    print(f"\nRaw steepest-slope LR: {best_lr_raw:.2e}")
+    print(f"Suggested safe learning rate: {best_lr:.2e}")
+
+    # -------------------------------
+    # Plot
+    # -------------------------------
+    plt.figure(figsize=(8,5))
+    plt.plot(lrs, losses, label="Loss")
+    plt.xscale("log")
+    plt.xlabel("Learning Rate")
+    plt.ylabel("Loss")
+    plt.title("VisualBERT Learning Rate Finder (Safe)")
+    plt.axvline(best_lr, color='r', linestyle='--', label=f'Safe LR: {best_lr:.2e}')
+    plt.legend()
+    plt.show()
+
+    return lrs, losses, best_lr
+
+import math
 
 def train_visualbert(
     directory_path: str,
@@ -338,13 +457,24 @@ def train_visualbert(
     filename: str = "visualbert_model.pt",
     num_epochs=10,
     batch_size=4,
-    lr=1e-5,
+    lr=5e-5,
+    patience=3,
+    weight_decay=0,
+    use_scheduler: bool = True,      # enables Warmup+Cosine
     log_probabilities: bool = False,
     seed: int = 42
 ):
     """
-    Train VisualBERT + classifier with epoch-level metrics and optional probability logging.
+    Train VisualBERT + classifier with warmup + cosine LR schedule (per batch),
+    full metrics logging, deterministic behavior, probability logging, and early stopping.
     """
+
+    import os, csv, math, random
+    import torch
+    import torch.nn as nn
+    from torch.utils.data import DataLoader
+    from tqdm import tqdm
+
     # -------------------------------
     # Deterministic seeds
     # -------------------------------
@@ -364,8 +494,7 @@ def train_visualbert(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    model = VisualBERTWithClassifier(num_classes)
-    model.to(device)
+    model = VisualBERTWithClassifier(num_classes).to(device)
 
     # -------------------------------
     # Data loaders
@@ -383,15 +512,34 @@ def train_visualbert(
         val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    # -------------------------------
+    # Scheduler: Warmup + Cosine Decay
+    # -------------------------------
+    scheduler = None
+    if use_scheduler:
+        total_training_steps = len(train_loader) * num_epochs
+        warmup_steps = int(0.1 * total_training_steps)  # 10% warmup
+
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            progress = (current_step - warmup_steps) / float(max(1, total_training_steps - warmup_steps))
+            return 0.5 * (1 + math.cos(math.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+    # -------------------------------
+    # Utility: Move stacked tensors to device
+    # -------------------------------
     def tensorize(x):
         if isinstance(x, torch.Tensor):
             return x.to(device)
         return torch.stack(x).to(device)
 
     # -------------------------------
-    # Metrics files
+    # File setup
     # -------------------------------
     model_name = os.path.splitext(filename)[0]
     model_folder = os.path.join(directory_path, model_name)
@@ -402,30 +550,42 @@ def train_visualbert(
 
     with open(train_metrics_path, "w", newline="") as f:
         csv.writer(f).writerow(["epoch", "loss", "accuracy", "macro_recall", "macro_precision", "macro_f1"])
+
     with open(val_metrics_path, "w", newline="") as f:
         csv.writer(f).writerow(["epoch", "loss", "accuracy", "macro_recall", "macro_precision", "macro_f1"])
 
-    # -------------------------------
-    # Per-sample probability headers
-    # -------------------------------
+    # Probability logging
     if log_probabilities:
         train_prob_path = os.path.join(model_folder, "train_per_sample_class_probabilities.csv")
         val_prob_path = os.path.join(model_folder, "val_per_sample_class_probabilities.csv") if val_input else None
-        header = ["epoch", "sample_index", "true_label", "pred_label"] + [f"class_{i}_prob" for i in range(num_classes)]
+
+        header = ["epoch", "sample_index", "true_label", "pred_label"] + [
+            f"class_{i}_prob" for i in range(num_classes)
+        ]
+
         with open(train_prob_path, "w", newline="") as f:
             csv.writer(f).writerow(header)
-        if val_input:
-            if val_prob_path is not None:
-                with open(val_prob_path, "w", newline="") as f:
-                    csv.writer(f).writerow(header)
 
+        if val_input and val_prob_path:
+            with open(val_prob_path, "w", newline="") as f:
+                csv.writer(f).writerow(header)
 
     # -------------------------------
-    # Training loop
+    # Early Stopping setup
     # -------------------------------
+    best_val_loss = float('inf')
+    counter = 0
+    best_model_state = None
+
+    # -------------------------------
+    # Training Loop
+    # -------------------------------
+    global_step = 0
+
     for epoch in range(num_epochs):
         model.train()
         running_loss = 0.0
+
         loop = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", leave=False)
 
         for batch in loop:
@@ -447,11 +607,22 @@ def train_visualbert(
             loss.backward()
             optimizer.step()
 
+            # Step scheduler PER BATCH
+            if scheduler is not None:
+                scheduler.step()
+                global_step += 1
+
             running_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
+            loop.set_postfix(loss=loss.item(), lr=optimizer.param_groups[0]["lr"])
 
         # -------------------------------
-        # Evaluate on train set
+        # Print current learning rate per epoch
+        # -------------------------------
+        current_lr = optimizer.param_groups[0]["lr"]
+        print(f"[Epoch {epoch+1}] Current LR: {current_lr:.2e}")
+
+        # -------------------------------
+        # Metrics (train)
         # -------------------------------
         train_metrics = evaluate_and_log(
             model=model,
@@ -464,12 +635,15 @@ def train_visualbert(
             prob_path=train_prob_path if log_probabilities else None,
             log_probabilities=log_probabilities
         )
-        print(f"[Epoch {epoch+1}] TRAIN → "
-              f"Loss: {train_metrics[0]:.4f} | Acc: {train_metrics[1]:.4f} | "
-              f"Recall: {train_metrics[2]:.4f} | Precision: {train_metrics[3]:.4f} | F1: {train_metrics[4]:.4f}")
+
+        print(
+            f"[Epoch {epoch+1}] TRAIN → Loss: {train_metrics[0]:.4f} "
+            f"| Acc: {train_metrics[1]:.4f} | Recall: {train_metrics[2]:.4f} "
+            f"| Precision: {train_metrics[3]:.4f} | F1: {train_metrics[4]:.4f}"
+        )
 
         # -------------------------------
-        # Evaluate on validation set
+        # Metrics (validation)
         # -------------------------------
         if val_input:
             val_metrics = evaluate_and_log(
@@ -483,12 +657,33 @@ def train_visualbert(
                 prob_path=val_prob_path if log_probabilities else None,
                 log_probabilities=log_probabilities
             )
-            print(f"[Epoch {epoch+1}] VAL → "
-                  f"Loss: {val_metrics[0]:.4f} | Acc: {val_metrics[1]:.4f} | "
-                  f"Recall: {val_metrics[2]:.4f} | Precision: {val_metrics[3]:.4f} | F1: {val_metrics[4]:.4f}")
+
+            print(
+                f"[Epoch {epoch+1}] VAL → Loss: {val_metrics[0]:.4f} "
+                f"| Acc: {val_metrics[1]:.4f} | Recall: {val_metrics[2]:.4f} "
+                f"| Precision: {val_metrics[3]:.4f} | F1: {val_metrics[4]:.4f}"
+            )
+
+            # -------------------------------
+            # Early Stopping check
+            # -------------------------------
+            current_val_loss = val_metrics[0]
+
+            if current_val_loss < best_val_loss:
+                best_val_loss = current_val_loss
+                counter = 0
+                best_model_state = model.state_dict()
+            else:
+                counter += 1
+                print(f"EarlyStopping counter: {counter} out of {patience}")
+                if counter >= patience:
+                    print(f"Early stopping triggered at epoch {epoch+1}")
+                    if best_model_state is not None:
+                        model.load_state_dict(best_model_state)
+                    break
 
     # -------------------------------
-    # Save model
+    # Save model (best weights if early stopping)
     # -------------------------------
     save_path = os.path.join(model_folder, filename)
     torch.save(model.state_dict(), save_path)

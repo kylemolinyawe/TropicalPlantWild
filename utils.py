@@ -124,17 +124,23 @@ def load_master_index(directory_path: str):
 
 import os
 
-def get_tensor_rois_file_paths(directory_path: str, dataset_split: str) -> list:
+def get_tensor_rois_file_paths(directory_path: str, dataset_split: str, master_index: list) -> list:
     """
-    Scans the dataset split folder for 'tensors_rois' and returns all .pt file paths.
+    Scans the dataset split folder for 'tensors_rois' and returns only .pt file paths
+    corresponding to IDs listed in master_index.
 
     Args:
         directory_path (str): Root path of the dataset.
         dataset_split (str): Subfolder of the dataset (e.g., 'train', 'test').
+        master_index (list of dicts): Each dict must contain an 'id' key.
 
     Returns:
-        list of str: Full paths to all .pt files inside tensors_rois folder.
+        list of str: Full paths to matching .pt files inside tensors_rois folder.
     """
+    import os
+
+    # Build set of IDs in master_index for fast lookup
+    valid_ids = {row["id"] for row in master_index}
 
     rois_dir = os.path.join(directory_path, dataset_split, "tensors_rois")
 
@@ -145,31 +151,37 @@ def get_tensor_rois_file_paths(directory_path: str, dataset_split: str) -> list:
     pt_file_paths = [
         os.path.join(rois_dir, f)
         for f in os.listdir(rois_dir)
-        if f.endswith(".pt")
+        if f.endswith(".pt") and os.path.splitext(f)[0] in valid_ids
     ]
 
     if not pt_file_paths:
-        print(f"[WARNING] No .pt files found in: {rois_dir}")
+        print(f"[WARNING] No matching .pt files found in: {rois_dir}")
 
     # Optional: sort for consistent ordering
     pt_file_paths.sort()
 
     return pt_file_paths
 
+
 import os
 
-def get_tensor_rois_features_file_paths(directory_path: str, dataset_split: str):
+def get_tensor_rois_features_file_paths(directory_path: str, dataset_split: str, master_index: list) -> list:
     """
     Scans the dataset split folder for 'tensors_rois_features' and returns
-    a list of all .pt file paths inside it.
+    only .pt file paths corresponding to IDs listed in master_index.
 
     Args:
         directory_path (str): Root dataset path
         dataset_split (str): Dataset split folder (e.g., 'train', 'val', 'test')
+        master_index (list of dicts): Each dict must contain an 'id' key.
 
     Returns:
-        List[str]: List of .pt file paths
+        List[str]: List of matching .pt file paths
     """
+    import os
+
+    # Build set of IDs in master_index for fast lookup
+    valid_ids = {row["id"] for row in master_index}
 
     features_dir = os.path.join(directory_path, dataset_split, "tensors_rois_features")
     if not os.path.exists(features_dir):
@@ -178,8 +190,14 @@ def get_tensor_rois_features_file_paths(directory_path: str, dataset_split: str)
     pt_file_paths = [
         os.path.join(features_dir, f)
         for f in os.listdir(features_dir)
-        if f.endswith(".pt")
+        if f.endswith(".pt") and os.path.splitext(f)[0] in valid_ids
     ]
+
+    if not pt_file_paths:
+        print(f"[WARNING] No matching .pt files found in: {features_dir}")
+
+    # Optional: sort for consistent ordering
+    pt_file_paths.sort()
 
     return pt_file_paths
 
